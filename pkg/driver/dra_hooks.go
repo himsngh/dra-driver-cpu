@@ -21,7 +21,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"slices"
 	"sort"
 	"time"
 
@@ -117,13 +116,12 @@ func (cp *CPUDriver) groupedCPUDeviceInfos() []groupedCPUDeviceInfo {
 // both ResourceSlice publication and PrepareResourceClaims device lookup.
 // Keep the ordering in one place so device names resolve to the same CPUs even
 // when Prepare runs before the first ResourceSlice publication after restart.
-func (cp *CPUDriver) cpuDeviceInfos() []cpuDeviceInfo {
+func cpuDeviceInfos(topo *cpuinfo.CPUTopology, reservedCPUSet cpuset.CPUSet) []cpuDeviceInfo {
 	reservedCPUs := make(map[int]bool)
-	for _, cpuID := range cp.reservedCPUs.List() {
+	for _, cpuID := range reservedCPUSet.List() {
 		reservedCPUs[cpuID] = true
 	}
 
-	topo := cp.cpuTopology
 	allCPUs := make([]cpuinfo.CPUInfo, 0, len(topo.CPUDetails))
 	availableCPUs := []cpuinfo.CPUInfo{}
 	for _, cpu := range topo.CPUDetails {
@@ -242,21 +240,21 @@ func (cp *CPUDriver) createGroupedCPUDeviceSlices(logger logr.Logger) [][]resour
 // It groups CPUs by physical core to assign consecutive device IDs to hyperthreads.
 // This allows the DRA scheduler, which requests resources in contiguous blocks,
 // to co-locate workloads on hyperthreads of the same core.
-func (cp *CPUDriver) createCPUDeviceSlices() [][]resourceapi.Device {
+func createCPUDeviceSlices(deviceInfos []cpuDeviceInfo, pcieRootMapper *store.PCIeRootMapper, smtEnabled bool) []resourceapi.Device {
 	var allDevices []resourceapi.Device
-	for _, deviceInfo := range cp.individualDeviceInfos {
+	for _, deviceInfo := range deviceInfos {
 		cpu := deviceInfo.cpu
 		deviceAttrs := map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
 			AttributeNUMANodeID: {IntValue: new(int64(cpu.NUMANodeID))},
 			AttributeSocketID:   {IntValue: new(int64(cpu.SocketID))},
-			AttributeSMTEnabled: {BoolValue: new(cp.cpuTopology.SMTEnabled)},
+			AttributeSMTEnabled: {BoolValue: new(smtEnabled)},
 			AttributeCacheL3ID:  {IntValue: new(int64(cpu.UncoreCacheID))},
 			AttributeCoreType:   {StringValue: new(cpu.CoreType.String())},
 			AttributeCoreID:     {IntValue: new(int64(cpu.CoreID))},
 			AttributeCPUID:      {IntValue: new(int64(cpu.CpuID))},
 		}
 		device.SetCompatibilityAttributes(deviceAttrs, int64(cpu.NUMANodeID))
-		addPCIeRootsAttribute(cp.pcieRootMapper, deviceAttrs, cpu.CpuID)
+		addPCIeRootsAttribute(pcieRootMapper, deviceAttrs, cpu.CpuID)
 
 		cpuDevice := resourceapi.Device{
 			Name:       deviceInfo.name,
@@ -265,13 +263,7 @@ func (cp *CPUDriver) createCPUDeviceSlices() [][]resourceapi.Device {
 		}
 		allDevices = append(allDevices, cpuDevice)
 	}
-
-	if len(allDevices) == 0 {
-		return nil
-	}
-
-	// Chunk devices into slices of at most devicesPerResourceSlice
-	return slices.Collect(slices.Chunk(allDevices, cp.devicesPerResourceSlice))
+	return allDevices
 }
 
 // PublishResources publishes ResourceSlice for CPU resources.

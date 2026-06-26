@@ -22,6 +22,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"slices"
 	"time"
 
 	"github.com/containerd/nri/pkg/stub"
@@ -95,7 +96,6 @@ type CPUDriver struct {
 	deviceNameToCPUID       map[string]int
 	deviceNameToSocketID    map[string]int
 	deviceNameToNUMANodeID  map[string]int
-	individualDeviceInfos   []cpuDeviceInfo
 	groupedDeviceInfos      []groupedCPUDeviceInfo
 	deviceSlices            [][]resourceapi.Device
 	reservedCPUs            cpuset.CPUSet
@@ -213,11 +213,17 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 		}
 		plugin.deviceSlices = plugin.createGroupedCPUDeviceSlices(logger)
 	} else {
-		plugin.individualDeviceInfos = plugin.cpuDeviceInfos()
-		for _, dev := range plugin.individualDeviceInfos {
-			plugin.deviceNameToCPUID[dev.name] = dev.cpu.CpuID
+		deviceInfos := cpuDeviceInfos(plugin.cpuTopology, plugin.reservedCPUs)
+		deviceNameToDeviceID := make(map[string]int)
+		for _, dev := range deviceInfos {
+			deviceNameToDeviceID[dev.name] = dev.cpu.CpuID
 		}
-		plugin.deviceSlices = plugin.createCPUDeviceSlices()
+		plugin.deviceNameToCPUID = deviceNameToDeviceID
+		devices := createCPUDeviceSlices(deviceInfos, plugin.pcieRootMapper, plugin.cpuTopology.SMTEnabled)
+		if len(devices) > 0 {
+			// Chunk devices into slices of at most devicesPerResourceSlice
+			plugin.deviceSlices = slices.Collect(slices.Chunk(devices, plugin.devicesPerResourceSlice))
+		}
 	}
 
 	return plugin, nil
