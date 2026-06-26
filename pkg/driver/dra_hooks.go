@@ -32,6 +32,7 @@ import (
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpumanager"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
 	cpumetrics "github.com/kubernetes-sigs/dra-driver-cpu/pkg/metrics"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/types"
@@ -192,7 +193,7 @@ func (cp *CPUDriver) createGroupedCPUDeviceSlices(logger logr.Logger) [][]resour
 				AttributeNumCPUs:    {IntValue: new(availableCPUs)},
 				AttributeSMTEnabled: {BoolValue: new(cp.cpuTopology.SMTEnabled)},
 			}
-			cp.setPCIeRootsAttribute(deviceAttrs, deviceInfo.cpus.UnsortedList()...)
+			addPCIeRootsAttribute(cp.pcieRootMapper, deviceAttrs, deviceInfo.cpus.UnsortedList()...)
 
 			devices = append(devices, resourceapi.Device{
 				Name:                     deviceInfo.name,
@@ -208,7 +209,7 @@ func (cp *CPUDriver) createGroupedCPUDeviceSlices(logger logr.Logger) [][]resour
 				AttributeNumCPUs:    {IntValue: new(availableCPUs)},
 			}
 			device.SetCompatibilityAttributes(deviceAttrs, int64(deviceInfo.numaNodeID))
-			cp.setPCIeRootsAttribute(deviceAttrs, deviceInfo.cpus.UnsortedList()...)
+			addPCIeRootsAttribute(cp.pcieRootMapper, deviceAttrs, deviceInfo.cpus.UnsortedList()...)
 
 			devices = append(devices, resourceapi.Device{
 				Name:                     deviceInfo.name,
@@ -221,7 +222,7 @@ func (cp *CPUDriver) createGroupedCPUDeviceSlices(logger logr.Logger) [][]resour
 				AttributeSMTEnabled: {BoolValue: new(cp.cpuTopology.SMTEnabled)},
 				AttributeNumCPUs:    {IntValue: new(availableCPUs)},
 			}
-			cp.setPCIeRootsAttribute(deviceAttrs, deviceInfo.cpus.UnsortedList()...)
+			addPCIeRootsAttribute(cp.pcieRootMapper, deviceAttrs, deviceInfo.cpus.UnsortedList()...)
 			devices = append(devices, resourceapi.Device{
 				Name:                     deviceInfo.name,
 				Attributes:               deviceAttrs,
@@ -255,7 +256,7 @@ func (cp *CPUDriver) createCPUDeviceSlices() [][]resourceapi.Device {
 			AttributeCPUID:      {IntValue: new(int64(cpu.CpuID))},
 		}
 		device.SetCompatibilityAttributes(deviceAttrs, int64(cpu.NUMANodeID))
-		cp.setPCIeRootsAttribute(deviceAttrs, cpu.CpuID)
+		addPCIeRootsAttribute(cp.pcieRootMapper, deviceAttrs, cpu.CpuID)
 
 		cpuDevice := resourceapi.Device{
 			Name:       deviceInfo.name,
@@ -602,11 +603,11 @@ func (cp *CPUDriver) HandleError(ctx context.Context, err error, msg string) {
 	}
 }
 
-func (cp *CPUDriver) setPCIeRootsAttribute(attrs map[resourceapi.QualifiedName]resourceapi.DeviceAttribute, cpuIDs ...int) {
+func addPCIeRootsAttribute(pcieRootMapper *store.PCIeRootMapper, attrs map[resourceapi.QualifiedName]resourceapi.DeviceAttribute, cpuIDs ...int) {
 	// Note: union semantics are correct because kernel cpulistaffinity currently collapses to NUMA granularity;
 	// grouped allocation at socket/NUMA level therefore covers all CPUs local to every reported root.
 	// See docs/dev/topology-linux-sysfs.md for in-depth exploration about the topic.
-	pcieRoots := cp.pcieRootMapper.GetPCIeRootsForCPU(cpuIDs...)
+	pcieRoots := pcieRootMapper.GetPCIeRootsForCPU(cpuIDs...)
 	if len(pcieRoots) == 0 {
 		return
 	}
