@@ -203,13 +203,20 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 	var devices []resourceapi.Device
 	if plugin.cpuDeviceMode == CPU_DEVICE_MODE_GROUPED {
 		deviceInfos := groupedCPUDeviceInfos(plugin.cpuDeviceGroupBy, plugin.cpuTopology, plugin.onlineCPUs, plugin.reservedCPUs)
+		deviceNameToDeviceID := make(map[string]int)
 		for _, dev := range deviceInfos {
 			switch plugin.cpuDeviceGroupBy {
 			case GROUP_BY_SOCKET:
-				plugin.deviceNameToSocketID[dev.name] = dev.socketID
+				deviceNameToDeviceID[dev.name] = dev.socketID
 			case GROUP_BY_NUMA_NODE:
-				plugin.deviceNameToNUMANodeID[dev.name] = dev.numaNodeID
+				deviceNameToDeviceID[dev.name] = dev.numaNodeID
 			}
+		}
+		switch plugin.cpuDeviceGroupBy {
+		case GROUP_BY_SOCKET:
+			plugin.deviceNameToSocketID = deviceNameToDeviceID
+		case GROUP_BY_NUMA_NODE:
+			plugin.deviceNameToNUMANodeID = deviceNameToDeviceID
 		}
 		devices = createGroupedCPUDeviceSlices(logger, plugin.cpuDeviceGroupBy, deviceInfos, plugin.pcieRootMapper, plugin.cpuTopology.SMTEnabled)
 	} else {
