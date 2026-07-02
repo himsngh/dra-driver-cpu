@@ -123,3 +123,88 @@ func TestSysFSOverlayUsesHostRootAsBase(t *testing.T) {
 		t.Errorf("host-root sysfs file = %q, want %q", got, want)
 	}
 }
+
+func TestSysFSOverlayUsesHostRootForTopology(t *testing.T) {
+	hostRoot := t.TempDir()
+	t.Setenv("HOST_ROOT", hostRoot)
+
+	writeFakeSysFSFile := func(name, contents string) {
+		t.Helper()
+
+		filename := filepath.Join(hostRoot, "sys", filepath.FromSlash(name))
+		if err := os.MkdirAll(filepath.Dir(filename), 0o755); err != nil {
+			t.Fatalf("create parent directory for %q: %v", filename, err)
+		}
+		if err := os.WriteFile(filename, []byte(contents), 0o600); err != nil {
+			t.Fatalf("write %q: %v", filename, err)
+		}
+	}
+
+	// This base topology exists only beneath HOST_ROOT.
+	writeFakeSysFSFile("devices/system/cpu/online", "42\n")
+	writeFakeSysFSFile("devices/system/cpu/smt/control", "off\n")
+	writeFakeSysFSFile("devices/system/node/node5/cpulist", "42\n")
+	writeFakeSysFSFile("devices/system/cpu/cpu42/node5", "")
+	writeFakeSysFSFile("devices/system/cpu/cpu42/topology/physical_package_id", "1\n")
+	writeFakeSysFSFile("devices/system/cpu/cpu42/topology/core_id", "3\n")
+	writeFakeSysFSFile("devices/system/cpu/cpu42/topology/cluster_id", "4\n")
+	writeFakeSysFSFile("devices/system/cpu/cpu42/cache/index3/level", "3\n")
+	writeFakeSysFSFile("devices/system/cpu/cpu42/cache/index3/id", "11\n")
+	writeFakeSysFSFile("devices/system/cpu/cpu42/cache/index3/shared_cpu_list", "42\n")
+
+	// Override two values while leaving the rest to the HOST_ROOT base.
+	overlayPath := filepath.Join(t.TempDir(), "sysfs-overlay.yaml")
+	overlayData := []byte(`
+/sys/devices/system/cpu/smt/control: "on\n"
+/sys/devices/system/cpu/cpu42/topology/physical_package_id: "7\n"
+`)
+	if err := os.WriteFile(overlayPath, overlayData, 0o600); err != nil {
+		t.Fatalf("write sysfs overlay: %v", err)
+	}
+
+	logger := testr.New(t)
+	sfs, err := newSysFS(logger, overlayPath)
+	if err != nil {
+		t.Fatalf("newSysFS() error = %v", err)
+	}
+
+	providers := driver.Providers{SysFS: sfs}
+	topology, err := providers.EnsureCPUInfo().GetCPUTopology(logger)
+	if err != nil {
+		t.Fatalf("GetCPUTopology() error = %v", err)
+	}
+
+	if got, want := topology.NumCPUs, 1; got != want {
+		t.Fatalf("NumCPUs = %d, want %d", got, want)
+	}
+	if !topology.SMTEnabled {
+		t.Error("SMTEnabled = false, want true from overlay")
+	}
+
+	cpu, ok := topology.CPUDetails[42]
+	if !ok {
+		t.Fatal("CPUDetails does not contain HOST_ROOT CPU 42")
+	}
+
+	// SocketID proves that overlay values take precedence.
+	if got, want := cpu.SocketID, 7; got != want {
+		t.Errorf("SocketID = %d, want %d", got, want)
+	}
+
+	// The remaining values prove fallback to the HOST_ROOT base filesystem.
+	if got, want := cpu.CoreID, 3; got != want {
+		t.Errorf("CoreID = %d, want %d", got, want)
+	}
+	if got, want := cpu.ClusterID, 4; got != want {
+		t.Errorf("ClusterID = %d, want %d", got, want)
+	}
+	if got, want := cpu.NUMANodeID, 5; got != want {
+		t.Errorf("NUMANodeID = %d, want %d", got, want)
+	}
+	if got, want := cpu.NumaNodeCPUSet.String(), "42"; got != want {
+		t.Errorf("NumaNodeCPUSet = %q, want %q", got, want)
+	}
+	if got, want := cpu.UncoreCacheID, 11; got != want {
+		t.Errorf("UncoreCacheID = %d, want %d", got, want)
+	}
+}
