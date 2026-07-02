@@ -37,8 +37,11 @@ func TestSystemCPUInfoUsesSysFSOverlay(t *testing.T) {
 
 	base := os.DirFS(filepath.Join(tmpDir, "sys")).(sysfs.FS)
 	overlayFS, err := sysfs.NewOverlayFromYAML(base, []byte(`
-/sys/devices/system/cpu/online: "0\n"
+/sys/devices/system/cpu/online: "0-1\n"
 /sys/devices/system/cpu/cpu0/topology/physical_package_id: "7\n"
+/sys/devices/system/node/node0/cpulist: "0\n"
+/sys/devices/system/node/node1/cpulist: "1\n"
+/sys/devices/system/cpu/cpu1/node1: ""
 `))
 	if err != nil {
 		t.Fatalf("NewOverlayFromYAML() error = %v", err)
@@ -49,10 +52,16 @@ func TestSystemCPUInfoUsesSysFSOverlay(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetCPUInfos() error = %v", err)
 	}
-	if got, want := len(infos), 1; got != want {
+	if got, want := len(infos), 2; got != want {
 		t.Fatalf("GetCPUInfos() returned %d CPUs, want %d", got, want)
 	}
 	if got, want := infos[0].SocketID, 7; got != want {
 		t.Fatalf("SocketID = %d, want %d", got, want)
+	}
+	if got, want := infos[1].NUMANodeID, 1; got != want {
+		t.Fatalf("CPU 1 NUMANodeID = %d, want %d", got, want)
+	}
+	if got, want := infos[1].NumaNodeCPUSet.String(), "1"; got != want {
+		t.Fatalf("CPU 1 NumaNodeCPUSet = %q, want %q", got, want)
 	}
 }

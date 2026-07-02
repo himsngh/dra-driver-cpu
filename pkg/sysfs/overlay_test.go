@@ -165,6 +165,45 @@ func TestNewOverlayFromYAML(t *testing.T) {
 	}
 }
 
+func TestOverlayNUMANodeMasksBaseSibling(t *testing.T) {
+	base := fstest.MapFS{
+		"devices/system/cpu/cpu2/node0": {
+			Data: []byte("../../../../node/node0"),
+			Mode: fs.ModeSymlink,
+		},
+		"devices/system/cpu/cpu2/topology/core_id": {
+			Data: []byte("2\n"),
+		},
+		"devices/pci0000:00/pci_bus/0000:00/cpulistaffinity": {
+			Data: []byte("0-1\n"),
+		},
+	}
+	overlayFS, err := NewOverlayFromYAML(base, []byte(`
+/sys/devices/system/cpu/cpu2/node1: ""
+/sys/devices/pci0001:00/pci_bus/0001:00/cpulistaffinity: "2-3\n"
+`))
+	if err != nil {
+		t.Fatalf("NewOverlayFromYAML() error = %v", err)
+	}
+
+	entries, err := fs.ReadDir(overlayFS, "devices/system/cpu/cpu2")
+	if err != nil {
+		t.Fatalf("ReadDir(cpu2) error = %v", err)
+	}
+	assertEntryNames(t, entries, []string{"node1", "topology"})
+
+	entries, err = fs.ReadDir(overlayFS, "devices")
+	if err != nil {
+		t.Fatalf("ReadDir(devices) error = %v", err)
+	}
+	assertEntryNames(t, entries, []string{"pci0000:00", "pci0001:00", "system"})
+
+	// Masking only affects the merged directory view; the base remains readable.
+	if _, err := overlayFS.ReadLink("devices/system/cpu/cpu2/node0"); err != nil {
+		t.Fatalf("ReadLink(base node0) error = %v", err)
+	}
+}
+
 func TestNewOverlayFromYAMLValidation(t *testing.T) {
 	base := fstest.MapFS{}
 	tests := []struct {
@@ -201,6 +240,11 @@ func TestNewOverlayFromYAMLValidation(t *testing.T) {
 			base: base,
 			data: "/sys/devices: file\n/sys/devices/value: value\n",
 		},
+		{
+			name: "multiple NUMA nodes for one CPU",
+			base: base,
+			data: "/sys/devices/system/cpu/cpu0/node0: \"\"\n/sys/devices/system/cpu/cpu0/node1: \"\"\n",
+		},
 	}
 
 	for _, tt := range tests {
@@ -209,6 +253,17 @@ func TestNewOverlayFromYAMLValidation(t *testing.T) {
 				t.Fatal("expected an error")
 			}
 		})
+	}
+}
+
+func assertEntryNames(t *testing.T, entries []fs.DirEntry, want []string) {
+	t.Helper()
+	got := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		got = append(got, entry.Name())
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("entry names = %v, want %v", got, want)
 	}
 }
 

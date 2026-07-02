@@ -118,6 +118,9 @@ func newOverlay(base FS, overlay map[string]string) (FS, error) {
 		dirs:  map[string]map[string]overlayFileInfo{".": {}},
 	}
 	overlayFS.buildDirectoryTree()
+	if err := overlayFS.validateNUMANodeEntries(); err != nil {
+		return nil, err
+	}
 	return overlayFS, nil
 }
 
@@ -160,6 +163,26 @@ func (o *overlayFS) buildDirectoryTree() {
 			}
 		}
 	}
+}
+
+func (o *overlayFS) validateNUMANodeEntries() error {
+	for dir, entries := range o.dirs {
+		if !isCPUDirectory(dir) {
+			continue
+		}
+
+		var nodeEntry string
+		for entryName := range entries {
+			if !isNUMANodeEntry(entryName) {
+				continue
+			}
+			if nodeEntry != "" {
+				return fmt.Errorf("sysfs overlay defines multiple NUMA nodes beneath %s: %s and %s", path.Join(Root, dir), nodeEntry, entryName)
+			}
+			nodeEntry = entryName
+		}
+	}
+	return nil
 }
 
 func (o *overlayFS) lookup(name string) (overlayFileInfo, bool) {
@@ -208,7 +231,15 @@ func (o *overlayFS) ReadDir(name string) ([]fs.DirEntry, error) {
 	if err != nil && !errors.Is(err, fs.ErrNotExist) && !errors.Is(err, syscall.ENOTDIR) {
 		return nil, err
 	}
+	// A CPU can belong to only one NUMA node. When the overlay moves the CPU to a different
+	// node topology discovery shows multiple directories causing discovery to show the stale base entry.
+	// Treat an overlaid nodeN as replacing the per-CPU NUMA-node directory entry while
+	// continuing to merge all unrelated sysfs entries.
+	maskBaseNUMANodes := isCPUDirectory(name) && hasNUMANodeEntry(overlayEntries)
 	for _, entry := range baseEntries {
+		if maskBaseNUMANodes && isNUMANodeEntry(entry.Name()) {
+			continue
+		}
 		entries[entry.Name()] = entry
 	}
 	for entryName, entry := range overlayEntries {
@@ -223,6 +254,36 @@ func (o *overlayFS) ReadDir(name string) ([]fs.DirEntry, error) {
 		return result[i].Name() < result[j].Name()
 	})
 	return result, nil
+}
+
+func hasNUMANodeEntry(entries map[string]overlayFileInfo) bool {
+	for entryName := range entries {
+		if isNUMANodeEntry(entryName) {
+			return true
+		}
+	}
+	return false
+}
+
+func isCPUDirectory(name string) bool {
+	return hasNumericSuffix(name, "devices/system/cpu/cpu")
+}
+
+func isNUMANodeEntry(name string) bool {
+	return hasNumericSuffix(name, "node")
+}
+
+func hasNumericSuffix(value, prefix string) bool {
+	suffix, ok := strings.CutPrefix(value, prefix)
+	if !ok || suffix == "" {
+		return false
+	}
+	for _, char := range suffix {
+		if char < '0' || char > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func (o *overlayFS) Lstat(name string) (fs.FileInfo, error) {
