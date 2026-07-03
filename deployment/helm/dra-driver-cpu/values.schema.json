@@ -51,6 +51,27 @@
       },
       "additionalProperties": false
     },
+    "extraArgs": {
+      "description": "Extra command-line arguments appended to the driver arguments",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "extraVolumeMounts": {
+      "description": "Extra volume mounts for the driver container",
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "extraVolumes": {
+      "description": "Extra volumes for the DaemonSet pod",
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
     "fullnameOverride": {
       "description": "Override the full release name",
       "type": "string"
@@ -156,13 +177,6 @@
           "description": "Annotations to add to the ServiceAccount",
           "type": "object"
         }
-      }
-    },
-    "sysfsOverlay": {
-      "description": "Sysfs file contents keyed by absolute /sys path; loaded once when the driver starts",
-      "type": "object",
-      "additionalProperties": {
-        "type": "string"
       }
     },
     "tolerations": {

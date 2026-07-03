@@ -1,0 +1,16 @@
+args:
+  exposePCIeRoots: true
+
+extraArgs:
+  - --sysfs-overlay=/etc/dra-driver-cpu/sysfs-overlay.yaml
+
+extraVolumeMounts:
+  - name: sysfs-overlay
+    mountPath: /etc/dra-driver-cpu/sysfs-overlay.yaml
+    subPath: sysfs-overlay.yaml
+    readOnly: true
+
+extraVolumes:
+  - name: sysfs-overlay
+    configMap:
+      name: dra-driver-cpu-sysfs-overlay-example

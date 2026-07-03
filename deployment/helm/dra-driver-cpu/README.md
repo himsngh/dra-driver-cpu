@@ -41,6 +41,9 @@ helm install dra-driver-cpu oci://registry.k8s.io/dra-driver-cpu/charts/dra-driv
 | args.hostnameOverride | string | `""` | Override the node name the driver registers under; omitted when empty |
 | args.logLevel | int | `4` | Log verbosity level passed as `--v` |
 | args.reservedCPUs | string | `""` | CPUs reserved for the OS and kubelet, excluded from DRA management (e.g. `"0-1"`); omitted when empty |
+| extraArgs | list | `[]` | Extra command-line arguments appended to the driver arguments |
+| extraVolumeMounts | list | `[]` | Extra volume mounts for the driver container |
+| extraVolumes | list | `[]` | Extra volumes for the DaemonSet pod |
 | fullnameOverride | string | `""` | Override the full release name |
 | healthzPath | string | `"/healthz"` | Path for liveness and readiness probes |
 | healthzPort | int | `8080` | Port the HTTP server binds to; used for the container port and probes |
@@ -57,7 +60,6 @@ helm install dra-driver-cpu oci://registry.k8s.io/dra-driver-cpu/charts/dra-driv
 | resources.requests.cpu | string | `"100m"` | CPU resource request |
 | resources.requests.memory | string | `"50Mi"` | Memory resource request |
 | serviceAccount.annotations | object | `{}` | Annotations to add to the ServiceAccount |
-| sysfsOverlay | object | `{}` | Sysfs file contents keyed by absolute /sys path; loaded once when the driver starts |
 | tolerations | list | `[{"effect":"NoSchedule","operator":"Exists"}]` | Node tolerations; defaults to tolerating all NoSchedule taints |
 
 ## Uninstallation
