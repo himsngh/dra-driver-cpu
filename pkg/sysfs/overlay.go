@@ -1,0 +1,377 @@
+/*
+Copyright The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package sysfs
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"os"
+	"path"
+	"sort"
+	"strings"
+	"syscall"
+	"time"
+
+	"sigs.k8s.io/yaml"
+)
+
+type overlayFS struct {
+	base  FS
+	files map[string][]byte
+	dirs  map[string]map[string]overlayFileInfo
+}
+
+// NewOverlayFromFile returns base overlaid with the sysfs values in filename.
+// An empty filename leaves base unchanged.
+func NewOverlayFromFile(base FS, filename string) (FS, error) {
+	if filename == "" {
+		return base, nil
+	}
+
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		return nil, fmt.Errorf("read sysfs overlay: %w", err)
+	}
+	overlay, err := NewOverlayFromYAML(base, data)
+	if err != nil {
+		return nil, fmt.Errorf("create sysfs overlay: %w", err)
+	}
+	return overlay, nil
+}
+
+// NewOverlayFromYAML returns a read-through sysfs configured from a YAML object
+// whose keys are absolute sysfs paths and whose values are replacement file
+// contents. All other operations are delegated to base.
+func NewOverlayFromYAML(base FS, data []byte) (FS, error) {
+	overlay, err := parseOverlay(data)
+	if err != nil {
+		return nil, err
+	}
+	return newOverlay(base, overlay)
+}
+
+func parseOverlay(data []byte) (map[string]string, error) {
+	rawOverlay := map[string]any{}
+	if err := yaml.UnmarshalStrict(data, &rawOverlay); err != nil {
+		return nil, fmt.Errorf("parse sysfs overlay: %w", err)
+	}
+
+	overlay := make(map[string]string, len(rawOverlay))
+	for overlayPath, value := range rawOverlay {
+		contents, ok := value.(string)
+		if !ok {
+			return nil, fmt.Errorf("parse sysfs overlay: value for %q must be a string", overlayPath)
+		}
+		overlay[overlayPath] = contents
+	}
+	return overlay, nil
+}
+
+func newOverlay(base FS, overlay map[string]string) (FS, error) {
+	if base == nil {
+		return nil, fmt.Errorf("base sysfs is nil")
+	}
+	if len(overlay) == 0 {
+		return base, nil
+	}
+
+	files := make(map[string][]byte, len(overlay))
+	for fullPath, contents := range overlay {
+		name, err := overlayName(fullPath)
+		if err != nil {
+			return nil, err
+		}
+		if _, ok := files[name]; ok {
+			return nil, fmt.Errorf("duplicate sysfs overlay path %q", fullPath)
+		}
+		files[name] = []byte(contents)
+	}
+
+	for name := range files {
+		for parent := path.Dir(name); parent != "."; parent = path.Dir(parent) {
+			if _, ok := files[parent]; ok {
+				return nil, fmt.Errorf("sysfs overlay path %q is both a file and a directory", path.Join(Root, parent))
+			}
+		}
+	}
+
+	overlayFS := &overlayFS{
+		base:  base,
+		files: files,
+		dirs:  map[string]map[string]overlayFileInfo{".": {}},
+	}
+	overlayFS.buildDirectoryTree()
+	if err := overlayFS.validateNUMANodeEntries(); err != nil {
+		return nil, err
+	}
+	return overlayFS, nil
+}
+
+func overlayName(fullPath string) (string, error) {
+	if !strings.HasPrefix(fullPath, Root+"/") {
+		return "", fmt.Errorf("sysfs overlay path %q must be beneath %s", fullPath, Root)
+	}
+	if clean := path.Clean(fullPath); clean != fullPath {
+		return "", fmt.Errorf("sysfs overlay path %q is not clean", fullPath)
+	}
+
+	name := strings.TrimPrefix(fullPath, Root+"/")
+	if !fs.ValidPath(name) {
+		return "", fmt.Errorf("invalid sysfs overlay path %q", fullPath)
+	}
+	return name, nil
+}
+
+func (o *overlayFS) buildDirectoryTree() {
+	for name, contents := range o.files {
+		parts := strings.Split(name, "/")
+		parent := "."
+		for i, part := range parts {
+			childPath := part
+			if parent != "." {
+				childPath = path.Join(parent, part)
+			}
+
+			info := overlayFileInfo{name: part, dir: i < len(parts)-1}
+			if !info.dir {
+				info.size = int64(len(contents))
+			}
+			o.dirs[parent][part] = info
+
+			if info.dir {
+				if _, ok := o.dirs[childPath]; !ok {
+					o.dirs[childPath] = map[string]overlayFileInfo{}
+				}
+				parent = childPath
+			}
+		}
+	}
+}
+
+func (o *overlayFS) validateNUMANodeEntries() error {
+	for dir, entries := range o.dirs {
+		if !isCPUDirectory(dir) {
+			continue
+		}
+
+		var nodeEntry string
+		for entryName := range entries {
+			if !isNUMANodeEntry(entryName) {
+				continue
+			}
+			if nodeEntry != "" {
+				return fmt.Errorf("sysfs overlay defines multiple NUMA nodes beneath %s: %s and %s", path.Join(Root, dir), nodeEntry, entryName)
+			}
+			nodeEntry = entryName
+		}
+	}
+	return nil
+}
+
+func (o *overlayFS) lookup(name string) (overlayFileInfo, bool) {
+	if data, ok := o.files[name]; ok {
+		return overlayFileInfo{name: path.Base(name), size: int64(len(data))}, true
+	}
+	if _, ok := o.dirs[name]; ok {
+		return overlayFileInfo{name: path.Base(name), dir: true}, true
+	}
+	return overlayFileInfo{}, false
+}
+
+func (o *overlayFS) Open(name string) (fs.File, error) {
+	if err := validFSName("open", name); err != nil {
+		return nil, err
+	}
+	info, ok := o.lookup(name)
+	if !ok {
+		return o.base.Open(name)
+	}
+
+	file := &overlayFile{path: name, info: info}
+	if info.dir {
+		entries, err := o.ReadDir(name)
+		if err != nil {
+			return nil, err
+		}
+		file.entries = entries
+	} else {
+		file.reader = bytes.NewReader(o.files[name])
+	}
+	return file, nil
+}
+
+func (o *overlayFS) ReadDir(name string) ([]fs.DirEntry, error) {
+	if err := validFSName("readdir", name); err != nil {
+		return nil, err
+	}
+	overlayEntries, hasOverlay := o.dirs[name]
+	if !hasOverlay {
+		return fs.ReadDir(o.base, name)
+	}
+
+	entries := map[string]fs.DirEntry{}
+	baseEntries, err := fs.ReadDir(o.base, name)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) && !errors.Is(err, syscall.ENOTDIR) {
+		return nil, err
+	}
+	// A CPU can belong to only one NUMA node. When the overlay moves the CPU to a different
+	// node topology discovery shows multiple directories causing discovery to show the stale base entry.
+	// Treat an overlaid nodeN as replacing the per-CPU NUMA-node directory entry while
+	// continuing to merge all unrelated sysfs entries.
+	maskBaseNUMANodes := isCPUDirectory(name) && hasNUMANodeEntry(overlayEntries)
+	for _, entry := range baseEntries {
+		if maskBaseNUMANodes && isNUMANodeEntry(entry.Name()) {
+			continue
+		}
+		entries[entry.Name()] = entry
+	}
+	for entryName, entry := range overlayEntries {
+		entries[entryName] = entry
+	}
+
+	result := make([]fs.DirEntry, 0, len(entries))
+	for _, entry := range entries {
+		result = append(result, entry)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].Name() < result[j].Name()
+	})
+	return result, nil
+}
+
+func hasNUMANodeEntry(entries map[string]overlayFileInfo) bool {
+	for entryName := range entries {
+		if isNUMANodeEntry(entryName) {
+			return true
+		}
+	}
+	return false
+}
+
+func isCPUDirectory(name string) bool {
+	return hasNumericSuffix(name, "devices/system/cpu/cpu")
+}
+
+func isNUMANodeEntry(name string) bool {
+	return hasNumericSuffix(name, "node")
+}
+
+func hasNumericSuffix(value, prefix string) bool {
+	suffix, ok := strings.CutPrefix(value, prefix)
+	if !ok || suffix == "" {
+		return false
+	}
+	for _, char := range suffix {
+		if char < '0' || char > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func (o *overlayFS) Lstat(name string) (fs.FileInfo, error) {
+	if err := validFSName("lstat", name); err != nil {
+		return nil, err
+	}
+	if info, ok := o.lookup(name); ok {
+		return info, nil
+	}
+	return o.base.Lstat(name)
+}
+
+func (o *overlayFS) ReadLink(name string) (string, error) {
+	if err := validFSName("readlink", name); err != nil {
+		return "", err
+	}
+	if _, ok := o.lookup(name); ok {
+		return "", &fs.PathError{Op: "readlink", Path: name, Err: syscall.EINVAL}
+	}
+	return o.base.ReadLink(name)
+}
+
+func validFSName(op, name string) error {
+	if fs.ValidPath(name) {
+		return nil
+	}
+	return &fs.PathError{Op: op, Path: name, Err: fs.ErrInvalid}
+}
+
+type overlayFileInfo struct {
+	name string
+	size int64
+	dir  bool
+}
+
+func (i overlayFileInfo) Name() string       { return i.name }
+func (i overlayFileInfo) Size() int64        { return i.size }
+func (i overlayFileInfo) ModTime() time.Time { return time.Time{} }
+func (i overlayFileInfo) IsDir() bool        { return i.dir }
+func (i overlayFileInfo) Sys() any           { return nil }
+
+func (i overlayFileInfo) Mode() fs.FileMode {
+	if i.dir {
+		return fs.ModeDir | 0555
+	}
+	return 0444
+}
+
+func (i overlayFileInfo) Type() fs.FileMode { return i.Mode().Type() }
+
+func (i overlayFileInfo) Info() (fs.FileInfo, error) { return i, nil }
+
+type overlayFile struct {
+	path    string
+	info    overlayFileInfo
+	reader  *bytes.Reader
+	entries []fs.DirEntry
+	offset  int
+}
+
+func (f *overlayFile) Close() error               { return nil }
+func (f *overlayFile) Stat() (fs.FileInfo, error) { return f.info, nil }
+
+func (f *overlayFile) Read(p []byte) (int, error) {
+	if f.info.dir {
+		return 0, &fs.PathError{Op: "read", Path: f.path, Err: syscall.EISDIR}
+	}
+	return f.reader.Read(p)
+}
+
+func (f *overlayFile) ReadDir(n int) ([]fs.DirEntry, error) {
+	if !f.info.dir {
+		return nil, &fs.PathError{Op: "readdir", Path: f.path, Err: syscall.ENOTDIR}
+	}
+	if n <= 0 {
+		entries := f.entries[f.offset:]
+		f.offset = len(f.entries)
+		return entries, nil
+	}
+	if f.offset >= len(f.entries) {
+		return nil, io.EOF
+	}
+
+	end := min(f.offset+n, len(f.entries))
+	entries := f.entries[f.offset:end]
+	f.offset = end
+	if len(entries) < n {
+		return entries, io.EOF
+	}
+	return entries, nil
+}

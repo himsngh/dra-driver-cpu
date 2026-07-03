@@ -21,11 +21,13 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
 
 	"github.com/go-logr/logr"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/sysfs"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/utils/cpuset"
 )
@@ -146,11 +148,13 @@ type CPUTopology struct {
 }
 
 // SystemCPUInfo provides information about the CPUs on the system.
-type SystemCPUInfo struct{}
+type SystemCPUInfo struct {
+	sysfs sysfs.FS
+}
 
-// NewSystemCPUInfo creates a new SystemCPUInfo.
-func NewSystemCPUInfo() *SystemCPUInfo {
-	return &SystemCPUInfo{}
+// NewSystemCPUInfo creates a new SystemCPUInfo backed by sysfs.
+func NewSystemCPUInfo(sfs sysfs.FS) *SystemCPUInfo {
+	return &SystemCPUInfo{sysfs: sfs}
 }
 
 // GetCPUTopology returns the CPUTopology of the system.
@@ -203,7 +207,7 @@ func (s *SystemCPUInfo) GetCPUTopology(logger logr.Logger) (*CPUTopology, error)
 
 // IsSMTEnabled checks if SMT is enabled on the system by reading /sys/devices/system/cpu/smt/control.
 func (s *SystemCPUInfo) IsSMTEnabled() (bool, error) {
-	status, err := ReadFile(hostSys("devices/system/cpu/smt/control"))
+	status, err := readFile(s.sysfs, path.Join("devices", "system", "cpu", "smt", "control"))
 	if err != nil {
 		return false, err
 	}
@@ -220,8 +224,7 @@ func (s *SystemCPUInfo) IsSMTEnabled() (bool, error) {
 
 // GetCPUInfos returns a slice of CPUInfo structs, one for each logical CPU.
 func (s *SystemCPUInfo) GetCPUInfos(logger logr.Logger) ([]CPUInfo, error) {
-	sysfs := os.DirFS(hostSys()).(fs.ReadLinkFS)
-	onlineCPUs, err := OnlineCPUs(logger, sysfs)
+	onlineCPUs, err := OnlineCPUs(logger, s.sysfs)
 	if err != nil {
 		return []CPUInfo{}, fmt.Errorf("could not get online CPUs: %w", err)
 	}
@@ -229,9 +232,9 @@ func (s *SystemCPUInfo) GetCPUInfos(logger logr.Logger) ([]CPUInfo, error) {
 	// Intel-specific hybrid detection (P-cores vs E-cores)
 	isHybrid := false
 	var eCoreCpus cpuset.CPUSet
-	eCoreFilename := hostSys("devices/cpu_atom/cpus")
-	if _, err := os.Stat(eCoreFilename); err == nil {
-		eCoreLines, err := ReadLines(eCoreFilename)
+	eCoreFilename := path.Join("devices", "cpu_atom", "cpus")
+	if _, err := fs.Stat(s.sysfs, eCoreFilename); err == nil {
+		eCoreLines, err := readLines(s.sysfs, eCoreFilename)
 		if err == nil {
 			isHybrid = true
 			eCoreCpus, err = cpuset.Parse(eCoreLines[0])
@@ -265,7 +268,7 @@ func (s *SystemCPUInfo) GetCPUInfos(logger logr.Logger) ([]CPUInfo, error) {
 			cpuInfo.CoreType = CoreTypeStandard
 		}
 
-		if err := populateTopologyInfo(&cpuInfo, logger); err != nil {
+		if err := populateTopologyInfo(s.sysfs, &cpuInfo, logger); err != nil {
 			logger.Info("skipping CPU due to incomplete topology", "cpuID", cpuID, "err", err)
 			continue
 		}
@@ -278,12 +281,12 @@ func (s *SystemCPUInfo) GetCPUInfos(logger logr.Logger) ([]CPUInfo, error) {
 	return cpuInfos, nil
 }
 
-func populateTopologyInfo(cpuInfo *CPUInfo, logger logr.Logger) error {
+func populateTopologyInfo(sfs sysfs.FS, cpuInfo *CPUInfo, logger logr.Logger) error {
 	cpuID := cpuInfo.CpuID
 
 	// Get Socket ID from sysfs
-	socketPath := hostSys(fmt.Sprintf("devices/system/cpu/cpu%d/topology/physical_package_id", cpuID))
-	socketStr, err := ReadFile(socketPath)
+	socketPath := path.Join("devices", "system", "cpu", fmt.Sprintf("cpu%d", cpuID), "topology", "physical_package_id")
+	socketStr, err := readFile(sfs, socketPath)
 	if err != nil {
 		return fmt.Errorf("could not read socket_id for cpu %d from sysfs: %w", cpuID, err)
 	}
@@ -295,8 +298,8 @@ func populateTopologyInfo(cpuInfo *CPUInfo, logger logr.Logger) error {
 
 	// Get Cluster ID from sysfs. While this sysfs file is present on most
 	// architectures, on ARM this defines the physical boundary for shared resources (like L2 cache).
-	clusterPath := hostSys(fmt.Sprintf("devices/system/cpu/cpu%d/topology/cluster_id", cpuID))
-	clusterStr, err := ReadFile(clusterPath)
+	clusterPath := path.Join("devices", "system", "cpu", fmt.Sprintf("cpu%d", cpuID), "topology", "cluster_id")
+	clusterStr, err := readFile(sfs, clusterPath)
 	if err == nil {
 		clusterID, err := strconv.Atoi(strings.TrimSpace(clusterStr))
 		if err != nil {
@@ -317,8 +320,8 @@ func populateTopologyInfo(cpuInfo *CPUInfo, logger logr.Logger) error {
 	}
 
 	// Get Core ID from sysfs
-	corePath := hostSys(fmt.Sprintf("devices/system/cpu/cpu%d/topology/core_id", cpuID))
-	coreStr, err := ReadFile(corePath)
+	corePath := path.Join("devices", "system", "cpu", fmt.Sprintf("cpu%d", cpuID), "topology", "core_id")
+	coreStr, err := readFile(sfs, corePath)
 	if err != nil {
 		return fmt.Errorf("could not read core_id for cpu %d from sysfs: %w", cpuID, err)
 	}
@@ -329,8 +332,8 @@ func populateTopologyInfo(cpuInfo *CPUInfo, logger logr.Logger) error {
 	cpuInfo.CoreID = coreID
 
 	// Get NUMA Node ID from sysfs
-	nodePath := hostSys(fmt.Sprintf("devices/system/cpu/cpu%d", cpuID))
-	files, err := os.ReadDir(nodePath)
+	nodePath := path.Join("devices", "system", "cpu", fmt.Sprintf("cpu%d", cpuID))
+	files, err := fs.ReadDir(sfs, nodePath)
 	if err != nil {
 		return fmt.Errorf("could not read NUMA node for cpu %d from sysfs: %w", cpuID, err)
 	}
@@ -347,8 +350,8 @@ func populateTopologyInfo(cpuInfo *CPUInfo, logger logr.Logger) error {
 			foundNode = true
 
 			// Get NUMA Affinity Mask
-			cpuListPath := hostSys(fmt.Sprintf("devices/system/node/node%d/cpulist", nodeID))
-			cpuListLines, err := ReadLines(cpuListPath)
+			cpuListPath := path.Join("devices", "system", "node", fmt.Sprintf("node%d", nodeID), "cpulist")
+			cpuListLines, err := readLines(sfs, cpuListPath)
 			if err != nil || len(cpuListLines) == 0 {
 				logger.V(2).Info("could not read sysfs data for NUMA affinity mask", "nodeID", nodeID, "err", err)
 				continue
@@ -370,8 +373,8 @@ func populateTopologyInfo(cpuInfo *CPUInfo, logger logr.Logger) error {
 	}
 
 	// Get L3 Cache ID
-	cachePath := hostSys(fmt.Sprintf("devices/system/cpu/cpu%d/cache", cpuID))
-	cacheEntries, err := os.ReadDir(cachePath)
+	cachePath := path.Join("devices", "system", "cpu", fmt.Sprintf("cpu%d", cpuID), "cache")
+	cacheEntries, err := fs.ReadDir(sfs, cachePath)
 	if err != nil {
 		return fmt.Errorf("could not read cache dir %s: %w", cachePath, err)
 	}
@@ -381,8 +384,8 @@ func populateTopologyInfo(cpuInfo *CPUInfo, logger logr.Logger) error {
 			continue
 		}
 
-		levelPath := filepath.Join(cachePath, entry.Name(), "level")
-		levelStr, err := ReadFile(levelPath)
+		levelPath := path.Join(cachePath, entry.Name(), "level")
+		levelStr, err := readFile(sfs, levelPath)
 		if err != nil {
 			continue
 		}
@@ -392,10 +395,10 @@ func populateTopologyInfo(cpuInfo *CPUInfo, logger logr.Logger) error {
 			continue
 		}
 
-		l3CacheDir := filepath.Join(cachePath, entry.Name())
+		l3CacheDir := path.Join(cachePath, entry.Name())
 
-		sharedCPUListPath := filepath.Join(l3CacheDir, "shared_cpu_list")
-		sharedCPUListStr, err := ReadFile(sharedCPUListPath)
+		sharedCPUListPath := path.Join(l3CacheDir, "shared_cpu_list")
+		sharedCPUListStr, err := readFile(sfs, sharedCPUListPath)
 		if err != nil {
 			return fmt.Errorf("could not read shared_cpu_list from %s: %w", sharedCPUListPath, err)
 		}
@@ -405,8 +408,8 @@ func populateTopologyInfo(cpuInfo *CPUInfo, logger logr.Logger) error {
 			return fmt.Errorf("could not parse shared_cpu_list '%s': %w", sharedCPUListStr, err)
 		}
 
-		cacheIdPath := filepath.Join(l3CacheDir, "id")
-		idStr, err := ReadFile(cacheIdPath)
+		cacheIdPath := path.Join(l3CacheDir, "id")
+		idStr, err := readFile(sfs, cacheIdPath)
 		var id int
 		if err != nil {
 			// Fallback for ARM systems missing the 'id' file: use the lowest shared CPU ID as the cache ID.
@@ -464,9 +467,8 @@ func populateCpuSiblings(cpuInfos []CPUInfo) {
 	}
 }
 
-// ReadFile reads contents from a file.
-func ReadFile(filename string) (string, error) {
-	data, err := os.ReadFile(filename)
+func readFile(sysfs fs.FS, filename string) (string, error) {
+	data, err := fs.ReadFile(sysfs, filename)
 	if err != nil {
 		return "", err
 	}
@@ -474,9 +476,8 @@ func ReadFile(filename string) (string, error) {
 	return string(data), nil
 }
 
-// ReadLines reads contents from a file and splits them by new lines.
-func ReadLines(filename string) ([]string, error) {
-	data, err := os.ReadFile(filename)
+func readLines(sysfs fs.FS, filename string) ([]string, error) {
+	data, err := fs.ReadFile(sysfs, filename)
 	if err != nil {
 		return nil, err
 	}

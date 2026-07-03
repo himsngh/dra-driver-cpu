@@ -34,8 +34,10 @@ import (
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/ctxlog"
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/driverconfig"
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/gatherinfo"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/driver"
 	cpumetrics "github.com/kubernetes-sigs/dra-driver-cpu/pkg/metrics"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/sysfs"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/sys/unix"
@@ -106,6 +108,11 @@ func run(logger logr.Logger) error {
 	reservedCPUSet, err := cpuset.Parse(driverFlags.ReservedCPUs)
 	if err != nil {
 		return fmt.Errorf("failed to parse reserved CPUs: %w", err)
+	}
+
+	sfs, err := newSysFS(logger, driverFlags.SysFSOverlay)
+	if err != nil {
+		return err
 	}
 
 	mux := http.NewServeMux()
@@ -184,6 +191,7 @@ func run(logger logr.Logger) error {
 	}
 	driverProviders := driver.Providers{
 		K8SClient: clientset,
+		SysFS:     sfs,
 	}
 	dracpu, err := driver.New(logger, driverProviders, &driverConfig)
 	if err != nil {
@@ -217,6 +225,20 @@ func run(logger logr.Logger) error {
 		fatalErr = errors.Join(fatalErr, fmt.Errorf("HTTP server shutdown error: %w", serverErr))
 	}
 	return fatalErr
+}
+
+func newSysFS(logger logr.Logger, overlayPath string) (sysfs.FS, error) {
+	base := os.DirFS(cpuinfo.GetEnv("HOST_ROOT", "/", "sys")).(sysfs.FS)
+	sfs, err := sysfs.NewOverlayFromFile(base, overlayPath)
+	if err != nil {
+		return nil, err
+	}
+
+	if overlayPath != "" {
+		logger.Info("loaded sysfs overlay", "path", overlayPath)
+	}
+
+	return sfs, nil
 }
 
 func printVersion(logger logr.Logger) {

@@ -31,6 +31,7 @@ import (
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/buildinfo"
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/driverconfig"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/sysfs"
 	"sigs.k8s.io/yaml"
 )
 
@@ -190,7 +191,17 @@ func createOutputFile(parentDir string, now time.Time, pid int) (*os.File, strin
 }
 
 func collectReport(logger logr.Logger, defaults driverconfig.Config, driverCmdlinePath string) (Report, error) {
-	sys := cpuinfo.NewSystemCPUInfo()
+	driverConfig := detectDriverConfig(defaults, driverCmdlinePath)
+	base := os.DirFS(cpuinfo.GetEnv("HOST_ROOT", "/", "sys")).(sysfs.FS)
+	overlayPath := driverConfig.SysFSOverlay
+	if overlayPath != "" {
+		overlayPath = driverFilesystemPath(driverCmdlinePath, overlayPath)
+	}
+	sfs, err := sysfs.NewOverlayFromFile(base, overlayPath)
+	if err != nil {
+		return Report{}, fmt.Errorf("load configured sysfs overlay %q from driver filesystem: %w", driverConfig.SysFSOverlay, err)
+	}
+	sys := cpuinfo.NewSystemCPUInfo(sfs)
 
 	topology, err := sys.GetCPUTopology(logger)
 	if err != nil {
@@ -209,8 +220,21 @@ func collectReport(logger logr.Logger, defaults driverconfig.Config, driverCmdli
 			Topology: makeTopologySummary(topology),
 			CPUs:     makeCPUList(cpus),
 		},
-		DriverConfig: detectDriverConfig(defaults, driverCmdlinePath),
+		DriverConfig: driverConfig,
 	}, nil
+}
+
+// driverFilesystemPath resolves a path in the running driver's mount namespace.
+// The cmdline file and the root/cwd links are siblings under /proc/<pid>.
+func driverFilesystemPath(driverCmdlinePath, name string) string {
+	processDir := filepath.Dir(driverCmdlinePath)
+	if filepath.IsAbs(name) {
+		return filepath.Join(processDir, "root", strings.TrimPrefix(filepath.Clean(name), string(filepath.Separator)))
+	}
+
+	// /proc/<pid>/cwd is a symlink, so path traversal must happen after that symlink has been resolved.
+	// e.g cwd/../overlay.yaml must refer to the parent of the driver's working directory, not /proc/<pid>/overlay.yaml.
+	return filepath.Join(processDir, "cwd") + string(filepath.Separator) + name
 }
 
 func makeTopologySummary(topology *cpuinfo.CPUTopology) TopologySummary {

@@ -43,6 +43,15 @@ podAnnotations: {}
 # -- Extra labels to add to pods
 podLabels: {}
 
+# -- Extra command-line arguments appended to the driver arguments
+extraArgs: [] # @schema item: string
+
+# -- Extra volume mounts for the driver container
+extraVolumeMounts: [] # @schema item: object
+
+# -- Extra volumes for the DaemonSet pod
+extraVolumes: [] # @schema item: object
+
 # @schema additionalProperties:false
 resources:
   # @schema additionalProperties:false
