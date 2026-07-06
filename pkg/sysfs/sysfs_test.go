@@ -43,3 +43,42 @@ func TestHostUsesHostRoot(t *testing.T) {
 		t.Errorf("Host() contents = %q, want %q", got, want)
 	}
 }
+
+func TestOverlayUsesHostRootAsBase(t *testing.T) {
+	hostRoot := t.TempDir()
+	t.Setenv("HOST_ROOT", hostRoot)
+
+	hostRootFile := filepath.Join(hostRoot, "sys", "devices", "system", "cpu", "host-root-only")
+	if err := os.MkdirAll(filepath.Dir(hostRootFile), 0o755); err != nil {
+		t.Fatalf("create host sysfs directory: %v", err)
+	}
+	if err := os.WriteFile(hostRootFile, []byte("from host root\n"), 0o600); err != nil {
+		t.Fatalf("write host sysfs file: %v", err)
+	}
+
+	overlayPath := filepath.Join(t.TempDir(), "sysfs-overlay.yaml")
+	if err := os.WriteFile(overlayPath, []byte(`/sys/devices/system/cpu/online: "999\n"`), 0o600); err != nil {
+		t.Fatalf("write sysfs overlay: %v", err)
+	}
+
+	overlayFS, err := NewOverlayFromFile(Host(), overlayPath)
+	if err != nil {
+		t.Fatalf("NewOverlayFromFile() error = %v", err)
+	}
+
+	data, err := fs.ReadFile(overlayFS, "devices/system/cpu/online")
+	if err != nil {
+		t.Fatalf("read overlaid sysfs file: %v", err)
+	}
+	if got, want := string(data), "999\n"; got != want {
+		t.Errorf("overlaid sysfs file = %q, want %q", got, want)
+	}
+
+	data, err = fs.ReadFile(overlayFS, "devices/system/cpu/host-root-only")
+	if err != nil {
+		t.Fatalf("read host-root sysfs file: %v", err)
+	}
+	if got, want := string(data), "from host root\n"; got != want {
+		t.Errorf("host-root sysfs file = %q, want %q", got, want)
+	}
+}
