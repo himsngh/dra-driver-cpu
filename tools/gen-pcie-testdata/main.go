@@ -63,6 +63,7 @@ func main() {
 		sfs = os.DirFS(sysfsRoot).(sysfs.FS)
 	}
 	logger := stdr.New(log.Default())
+	logger.Info("using filesystem roots", "sysfs", sfs, "procfs", cpuinfo.ProcfsRoot())
 
 	// need to silence output on the happy path so we can
 	// trivially redirect the output to a file
